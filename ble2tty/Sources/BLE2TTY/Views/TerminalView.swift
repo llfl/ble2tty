@@ -214,10 +214,20 @@ struct TerminalView: View {
 
     /// 「写入芯片/应用」的提示: 含最近一次成功下发的参数
     private var writeChipHelp: String {
-        var tip = model.activeLinkKind == .ble
-            ? "通过 0xFFF3 配置通道下发串口参数(指令 0x06), 芯片回包校验"
-            : "经 termios 本地设置串口参数, 立即生效"
-        if let active = model.activeSerial {
+        var tip: String
+        if model.activeLinkKind == .ble {
+            switch ble.transportProfile {
+            case .ch9140:
+                tip = "通过 0xFFF3 配置通道下发串口参数(指令 0x06), 芯片回包校验"
+            case .ffe1:
+                tip = "当前 BLE UART 仅提供透明透传, 不支持 CH9140 串口参数配置"
+            case nil:
+                tip = "连接 BLE 设备后按其 profile 显示串口配置能力"
+            }
+        } else {
+            tip = "经 termios 本地设置串口参数, 立即生效"
+        }
+        if model.canConfigureSerialParameters, let active = model.activeSerial {
             tip += "\n芯片当前: \(active.baudRate)/\(active.dataBits)/\(active.stopBits)/\(Self.parityShort[Int(min(active.parity, 4))])"
         }
         return tip
@@ -270,7 +280,7 @@ struct TerminalView: View {
             Button(model.applyingConfig ? "配置中…" : (model.activeLinkKind == .ble ? "写入芯片" : "应用")) {
                 model.applySerialParameters()
             }
-            .disabled(!model.isLinkReady || model.applyingConfig)
+            .disabled(!model.isLinkReady || model.applyingConfig || !model.canConfigureSerialParameters)
             .help(writeChipHelp)
         }
     }

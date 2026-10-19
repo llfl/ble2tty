@@ -47,7 +47,7 @@ struct DeviceListView: View {
                 .tint(ble.isScanning ? .red : .accentColor)
                 .disabled(ble.bluetoothState != .poweredOn)
                 .help(ble.bluetoothState == .poweredOn
-                      ? "扫描广播 CH9140 透传服务(0xFFF0)的设备"
+                      ? "扫描 CH9140(0xFFF0) 与 BLE UART(0xFFE0)设备"
                       : "蓝牙不可用")
             }
             .padding(10)
@@ -121,7 +121,7 @@ struct DeviceListView: View {
                         .font(.system(size: 30))
                         .foregroundStyle(.tertiary)
                 }
-                Text(ble.isScanning ? "正在搜索 CH9140 设备…" : "未发现设备\n点击上方按钮开始扫描")
+                Text(ble.isScanning ? "正在搜索 BLE 串口设备…" : "未发现设备\n点击上方按钮开始扫描")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)

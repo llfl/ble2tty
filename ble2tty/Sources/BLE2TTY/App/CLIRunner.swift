@@ -112,9 +112,27 @@ enum CLIRunner {
 
         // 串口工具设置波特率 -> 自动同步给芯片(0xFFF3 / 0x06)
         port.onBaudChange = { params in
+            guard ble.supportsCH9140Configuration else {
+                say("[PTY] 当前 BLE UART 仅支持透明透传, 跳过 CH9140 波特率配置")
+                return
+            }
             say("[PTY] 串口工具设置参数 -> \(params.baudRate) bps \(params.dataBits) 数据位 \(params.stopBits) 停止位 校验 \(params.parity), 同步芯片…")
             ble.applySerialParameters(params) { ok, info in
                 say("[BLE] 跟随同步结果: \(ok ? "成功" : "失败")(\(info))")
+            }
+        }
+
+        func createVirtualPort() {
+            do {
+                let link = try port.open(name: portName)
+                // open() 的创建日志经主队列异步投递, CLI_READY 排在其后。
+                DispatchQueue.main.async {
+                    say("CLI_READY port=\(link) compat=\(port.compatLinkPath)")
+                    state.ready = true
+                }
+            } catch {
+                say("[CLI] 创建虚拟串口失败: \(error.localizedDescription)")
+                exit(3)
             }
         }
 
@@ -125,25 +143,19 @@ enum CLIRunner {
                 DeviceMACResolver.connectedDeviceMAC(name: ble.connectedDeviceName) { mac in
                     if let mac { say("[BLE] 设备 MAC: \(mac)") }
                 }
-                // 连接就绪: 先下发目标串口参数, 再创建虚拟串口
-                let p = SerialParameters(baudRate: baud, dataBits: 8, stopBits: 1, parity: 0)
-                ble.applySerialParameters(p) { ok, info in
-                    say("[BLE] 下发串口参数 \(baud) 8N1: \(ok ? "成功" : "失败")(\(info))")
-                    ble.applyModemLines(ModemLines(flowControl: false, dtr: 0, rts: 0)) { ok2, info2 in
-                        say("[BLE] 关闭流控: \(ok2 ? "成功" : "失败")(\(info2))")
-                    }
-                    do {
-                        let link = try port.open(name: portName)
-                        // open() 的"虚拟串口已创建"日志经主队列异步投递,
-                        // CLI_READY 也排队到其后, 避免就绪行出现在创建日志之前的误导顺序
-                        DispatchQueue.main.async {
-                            say("CLI_READY port=\(link) compat=\(port.compatLinkPath)")
-                            state.ready = true
+                if ble.supportsCH9140Configuration {
+                    // CH9140 就绪后下发串口参数, 再创建虚拟串口。
+                    let p = SerialParameters(baudRate: baud, dataBits: 8, stopBits: 1, parity: 0)
+                    ble.applySerialParameters(p) { ok, info in
+                        say("[BLE] 下发串口参数 \(baud) 8N1: \(ok ? "成功" : "失败")(\(info))")
+                        ble.applyModemLines(ModemLines(flowControl: false, dtr: 0, rts: 0)) { ok2, info2 in
+                            say("[BLE] 关闭流控: \(ok2 ? "成功" : "失败")(\(info2))")
                         }
-                    } catch {
-                        say("[CLI] 创建虚拟串口失败: \(error.localizedDescription)")
-                        exit(3)
+                        createVirtualPort()
                     }
+                } else {
+                    say("[BLE] FFE1 透明透传就绪, 跳过 CH9140 串口与 MODEM 配置")
+                    createVirtualPort()
                 }
             case .failed(let m):
                 say("[CLI] 连接失败: \(m)")

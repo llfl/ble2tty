@@ -11,7 +11,7 @@
 [![Swift](https://img.shields.io/badge/swift-5.9+-f05138?logo=swift&logoColor=white)](https://github.com/oenhu/ble2tty)
 [![License](https://img.shields.io/github/license/oenhu/ble2tty?color=34a853)](LICENSE)
 
-**CH9140 蓝牙转串口 ↔ Mac 虚拟串口 (PTY)** · 内置终端仿真 / 收发监视 / 会话日志 · GUI + CLI
+**CH9140 / FFE1 蓝牙转串口 ↔ Mac 虚拟串口 (PTY)** · 内置终端仿真 / 收发监视 / 会话日志 · GUI + CLI
 
 </div>
 
@@ -32,7 +32,8 @@
 | 功能 | 说明 |
 |---|---|
 | 有线串口 | 直连 `/dev/cu.*` USB 串口(IOKit 枚举友好名), 任意波特率(含 460800/921600 等 PTY 无法表达的高速率), 流控/DTR/RTS(TIOCM*), CTS/DSR/RI/DCD 状态灯, 拔出自动落定+自动重连 |
-| BLE 扫描/连接 | 自动过滤 CH9140 透传服务(0xFFF0), 可切换显示全部设备, 信号强度排序 |
+| BLE 扫描/连接 | 默认识别 CH9140 (0xFFF0) 与 BLE UART (0xFFE0 / 0xFFE1), 可切换显示全部设备, 信号强度排序 |
+| FFE1 BLE UART | 同一 FFE1 特征收发透明字节流; 优先无响应写, 并按 GATT 属性选择写类型; 不发送 CH9140 控制帧 |
 | 设备 MAC 识别 | 连接就绪时自动解析设备真实 MAC(每两位 `-` 分割, 如 `DC-04-5A-5E-12-5B`), 显示于 最近连接/发现设备/状态栏; CH9140 出厂同名, MAC 是区分不同芯片的稳定标识。CoreBluetooth 不提供 MAC, 经系统蓝牙报告查询并缓存到最近连接 |
 | 虚拟串口 | 基于 PTY 伪终端, 无需内核扩展; 路径 `~/Library/Application Support/BLE2TTY/cu.CH9140` |
 | 波特率跟随 | 串口工具 `tcsetattr` 修改波特率/数据位/停止位/校验 → 自动经 0xFFF3 下发给芯片 |
@@ -42,6 +43,8 @@
 | 监视终端 | 收发监视(HEX/文本), 按行合并分包数据, 支持跨行复制; 整行发送(默认 CR 行尾, 带最近发送历史) + **交互模式**(键盘直连: Tab 补全/↑↓ 历史/Ctrl+C/Cmd+V 粘贴/退格编辑, 回显自动重绘) |
 | 终端仿真 | 完整终端仿真器(SwiftTerm): ANSI 转义解析, 5000 行回滚, 键盘直连; 输入区聚焦时自动切换英文输入法, 移开自动恢复(可关闭) |
 | 自动重连 | 意外断开或连接失败后自动重连: 指数退避(2s 起 30s 封顶, 不限次), 蓝牙关闭时挂起待恢复; 系统未缓存设备时自动转扫描查找(可在设置关闭) |
+
+HM-10/HM-11 默认 GATT 映射参考济南华茂《HM Bluetooth module datasheet》（V609/V705，2019-08）：服务 `0xFFE0`、特征 `0xFFE1`，支持 Notify/Write；UUID 可通过 AT 命令配置。手册第 4 页说明透传固件连接后通过 UART 收发蓝牙数据。[原厂手册（第三方托管副本，第 3–4 页）](https://device.report/m/9ca714ca0f2e4fc00ad2007b9050f8321dde8ef5ed4edca14b87b9a995d1f1c5.pdf#page=3)
 
 ## 构建与运行
 
@@ -121,6 +124,9 @@ BLE2TTY.app/Contents/MacOS/BLE2TTY --cli \
 就绪前的连接失败会在超时预算内自动重试; 就绪后断开不做重连。
 SIGINT/SIGTERM 均会清理虚拟串口符号链接后再退出。
 
+FFE1 BLE UART 可通过 `--name <设备名>` 或 `--uuid <CoreBluetooth UUID>` 选择。
+该模式只转发原始字节，不下发 CH9140 波特率、流控或 MODEM 配置。
+
 ## 技术说明
 
 ```
@@ -131,6 +137,10 @@ BLE2TTY App ◄─────── master fd ◄──────────
                      tcsetattr 巡检 ─────► 0xFFF3 (0x06 配置串口 / 0x07 流控)
                      MODEM 状态  ◄──────── 0xFFF3 (0x88 上报)
 ```
+
+FFE1 BLE UART 使用 FFE0 服务与 FFE1 特征；FFE1 同时承载通知接收和发送，
+优先使用无响应写，特征只支持响应写时按其属性改用响应写。它作为透明字节通道运行，
+不使用 FFF3 配置协议。
 
 - 为什么用 PTY 而不是内核驱动: macOS 早已废弃第三方串口 kext, DriverKit 串口驱动
   需要额外 entitlement 与公证; PTY + `cu.*` 符号链接对所有串口工具透明, 零安装。

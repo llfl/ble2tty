@@ -59,6 +59,9 @@ public final class BridgeModel: ObservableObject {
     public var isLinkReady: Bool {
         activeLinkKind == .ble ? ble.isReady : wired.isReady
     }
+    public var canConfigureSerialParameters: Bool {
+        activeLinkKind == .wired || ble.supportsCH9140Configuration
+    }
     /// 活动链路的连接状态(状态栏指示)
     public var activeConnectionState: BLEConnectionState {
         activeLinkKind == .ble ? ble.connectionState : wired.connectionState
@@ -245,7 +248,7 @@ public final class BridgeModel: ObservableObject {
                 if self.settings.logEnabled {
                     self.startLog()
                 }
-                if self.settings.applyDefaultsOnConnect {
+                if self.settings.applyDefaultsOnConnect && self.ble.supportsCH9140Configuration {
                     self.applySerialParameters()
                     self.applyModemLines()
                 }
@@ -385,7 +388,8 @@ public final class BridgeModel: ObservableObject {
                 self.editDataBits = params.dataBits
                 self.editStopBits = params.stopBits
                 self.editParity   = params.parity
-                guard self.settings.followVirtualPortBaud, self.isLinkReady else { return }
+                guard self.settings.followVirtualPortBaud, self.isLinkReady,
+                      self.canConfigureSerialParameters else { return }
                 self.applySerialParameters()
             }
         }
@@ -448,6 +452,10 @@ public final class BridgeModel: ObservableObject {
     // MARK: - 参数下发
 
     public func applySerialParameters() {
+        guard activeLinkKind == .wired || ble.supportsCH9140Configuration else {
+            appendSystem("当前 BLE UART 仅提供透明透传, 不支持 CH9140 串口参数配置")
+            return
+        }
         let params = SerialParameters(baudRate: editBaudRate, dataBits: editDataBits,
                                       stopBits: editStopBits, parity: editParity)
         applyingConfig = true
@@ -464,6 +472,10 @@ public final class BridgeModel: ObservableObject {
     }
 
     public func applyModemLines() {
+        guard activeLinkKind == .wired || ble.supportsCH9140Configuration else {
+            appendSystem("当前 BLE UART 仅提供透明透传, 不支持 CH9140 流控/MODEM 配置")
+            return
+        }
         let lines = ModemLines(flowControl: editFlowControl, dtr: editDTR, rts: editRTS)
         let done: (Bool, String) -> Void = { [weak self] ok, info in
             guard let self else { return }

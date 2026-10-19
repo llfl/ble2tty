@@ -63,7 +63,9 @@ private struct GeneralSettingsTab: View {
 
             Section {
                 Toggle("连接成功后自动下发默认参数到芯片", isOn: $settings.applyDefaultsOnConnect)
+                    .disabled(model.activeLinkKind == .ble && ble.transportProfile == .ffe1)
                 Toggle("虚拟串口波特率变化时自动同步给芯片", isOn: $settings.followVirtualPortBaud)
+                    .disabled(model.activeLinkKind == .ble && ble.transportProfile == .ffe1)
                 Toggle("意外断开后自动重连", isOn: $settings.autoReconnect)
             } header: {
                 Text("连接行为").font(.headline)
@@ -85,9 +87,13 @@ private struct GeneralSettingsTab: View {
                     }
                     Button("应用") { model.applyModemLines() }
                         .controlSize(.small)
-                        .disabled(!model.isLinkReady)
-                        .help("通过 0xFFF3 配置通道下发流控与 MODEM 输出(指令 0x07)")
+                        .disabled(!model.isLinkReady
+                                  || (model.activeLinkKind == .ble && ble.transportProfile == .ffe1))
+                        .help(model.activeLinkKind == .ble && ble.transportProfile == .ffe1
+                              ? "当前 BLE UART 仅支持透明透传"
+                              : "通过 0xFFF3 配置通道下发流控与 MODEM 输出(指令 0x07)")
                 }
+                .disabled(model.activeLinkKind == .ble && ble.transportProfile == .ffe1)
                 Toggle("硬件流控(CTS/RTS)", isOn: $model.editFlowControl)
                     .help("CTS/RTS 硬件流控(指令 0x07)")
                 Toggle("DTR 输出电平", isOn: bitBinding(\.editDTR))

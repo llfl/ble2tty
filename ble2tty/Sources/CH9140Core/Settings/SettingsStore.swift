@@ -137,7 +137,7 @@ public final class SettingsStore: ObservableObject {
     @Published public var autoReconnect: Bool {
         didSet { defaults.set(autoReconnect, forKey: key("autoReconnect")) }
     }
-    /// 扫描时显示全部 BLE 设备(默认只显示 CH9140 服务 FFF0 的设备)
+    /// 扫描时显示全部 BLE 设备(默认显示 CH9140 FFF0 与 BLE UART FFE0)
     @Published public var showAllDevices: Bool {
         didSet { defaults.set(showAllDevices, forKey: key("showAllDevices")) }
     }

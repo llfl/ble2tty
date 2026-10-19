@@ -1,6 +1,6 @@
 //
 //  BLEManager.swift
-//  CH9140 蓝牙中心端: 扫描/连接/透传收发/参数配置
+//  BLE UART 中心端: CH9140 与 FFE1 扫描/连接/透传收发
 //  逻辑对照 WCH 官方 iOS CH9140BluetoothManager
 //
 
@@ -38,6 +38,7 @@ public final class BLEManager: NSObject, ObservableObject {
     @Published public private(set) var isScanning = false
     @Published public private(set) var devices: [DiscoveredDevice] = []
     @Published public private(set) var connectionState: BLEConnectionState = .disconnected
+    @Published public private(set) var transportProfile: BLETransportProfile?
     @Published public private(set) var connectedDeviceName: String = ""
     @Published public private(set) var modemStatus = ModemStatus()
     /// 芯片 UART 发送缓冲区满(0x88 上报)
@@ -65,6 +66,11 @@ public final class BLEManager: NSObject, ObservableObject {
     private var readChar: CBCharacteristic?
     private var writeChar: CBCharacteristic?
     private var configChar: CBCharacteristic?
+    private var activeProfileOnQueue: BLETransportProfile?
+    private var dataWriteMode: BLEWriteMode?
+    private var dataWriteLength = 0
+    private var responseWriteInFlight = false
+    private var notifiedCharacteristicUUIDs: Set<String> = []
 
     private var wantScan = false
     private var scanShowAll = false
@@ -127,6 +133,9 @@ public final class BLEManager: NSObject, ObservableObject {
     }
 
     public var isReady: Bool { connectionState == .ready }
+    public var supportsCH9140Configuration: Bool {
+        transportProfile?.supportsCH9140Configuration == true
+    }
 
     // MARK: - 扫描
 
@@ -149,7 +158,7 @@ public final class BLEManager: NSObject, ObservableObject {
                 CBCentralManagerScanOptionAllowDuplicatesKey: true
             ])
             self.updateMain { $0.isScanning = true }
-            self.log(showAll ? "开始扫描全部 BLE 设备…" : "开始扫描 CH9140 设备(服务 FFF0)…")
+            self.log(showAll ? "开始扫描全部 BLE 设备…" : "开始扫描 CH9140 (FFF0) / BLE UART (FFE0) 设备…")
         }
     }
 
@@ -222,6 +231,7 @@ public final class BLEManager: NSObject, ObservableObject {
     /// 在 bleQueue 调用: 发起连接并启动超时保护(覆盖 连接+服务发现 全程, ready 时解除)
     private func startConnecting(_ p: CBPeripheral) {
         isReadyOnQueue = false
+        clearTransportSelection()
         cancelPendingScanConnect()
         // 转连新目标前先清理旧连接: CoreBluetooth 允许同时连多个外设,
         // 不主动断开的话旧设备的数据会继续从 FFF1 涌进来造成串流
@@ -232,7 +242,6 @@ public final class BLEManager: NSObject, ObservableObject {
             log("断开当前设备, 转连新设备")
             central.cancelPeripheralConnection(old)
             peripheral = nil
-            readChar = nil; writeChar = nil; configChar = nil
             clearOutbox()
         }
         connectTimeout?.cancel()
@@ -246,7 +255,8 @@ public final class BLEManager: NSObject, ObservableObject {
             self.activePeripheralID = nil
             self.isReadyOnQueue = false
             self.updateMain { $0.connectedUUID = nil }
-            self.log("连接超时: 设备无响应(可能正被其他主机占用, CH9140 只支持单连接; 不在范围内; 或固件缺少 FFF1/FFF2/FFF3 透传特征)")
+            self.clearTransportSelection()
+            self.log("连接超时: 设备无响应(可能正被其他主机占用, 不在范围内, 或缺少受支持的 BLE 串口特征)")
             self.setState(.failed("连接超时"))
         }
         connectTimeout = timeout
@@ -281,7 +291,7 @@ public final class BLEManager: NSObject, ObservableObject {
                 self.activePeripheralID = nil
                 self.isReadyOnQueue = false
                 self.peripheral = nil
-                self.readChar = nil; self.writeChar = nil; self.configChar = nil
+                self.clearTransportSelection()
                 self.clearOutbox()
                 self.stopRSSIPolling()
                 self.setState(.disconnected)
@@ -292,7 +302,7 @@ public final class BLEManager: NSObject, ObservableObject {
 
     // MARK: - 透传发送
 
-    /// 串口方向: 主机 -> 芯片 (FFF2, WriteWithoutResponse, 按 MTU 分包)
+    /// 串口方向: 主机 -> BLE UART, 按当前特征写入长度分包
     public func send(_ data: Data) {
         guard !data.isEmpty else { return }
         bleQueue.async {
@@ -310,7 +320,7 @@ public final class BLEManager: NSObject, ObservableObject {
                     dropped += self.outboxChunks[self.outboxHead].count
                     self.outboxHead += 1
                 }
-                self.log("芯片发送缓冲区持续满载, 发送队列溢出, 已丢弃最旧 \(dropped) 字节")
+                self.log("BLE 发送缓冲区持续满载, 发送队列溢出, 已丢弃最旧 \(dropped) 字节")
             }
             self.pumpOutbox()
         }
@@ -318,12 +328,20 @@ public final class BLEManager: NSObject, ObservableObject {
 
     /// 必须在 bleQueue 调用
     private func pumpOutbox() {
-        guard let p = peripheral, let wc = writeChar, !chipFullFlag else { return }
-        let mtu = max(20, p.maximumWriteValueLength(for: .withoutResponse))
-        while outboxHead < outboxChunks.count, p.canSendWriteWithoutResponse {
+        guard let p = peripheral, let wc = writeChar,
+              let profile = activeProfileOnQueue,
+              let mode = dataWriteMode,
+              !profile.supportsCH9140Configuration || !chipFullFlag else { return }
+        while outboxHead < outboxChunks.count {
+            if mode == .withoutResponse {
+                guard p.canSendWriteWithoutResponse else { break }
+            } else if responseWriteInFlight {
+                break
+            }
             let chunk = outboxChunks[outboxHead]
-            let n = min(mtu, chunk.count)
-            p.writeValue(Data(chunk.prefix(n)), for: wc, type: .withoutResponse)
+            let n = min(dataWriteLength, chunk.count)
+            p.writeValue(Data(chunk.prefix(n)), for: wc, type: mode.coreBluetoothType)
+            if mode == .withResponse { responseWriteInFlight = true }
             outboxBytes -= n
             if n == chunk.count {
                 outboxHead += 1
@@ -331,6 +349,7 @@ public final class BLEManager: NSObject, ObservableObject {
                 // 大块按 MTU 截发: 余量写回(拷贝 ≤ 单块大小, 不再是全队列 O(n) 搬移)
                 outboxChunks[outboxHead] = chunk.dropFirst(n)
             }
+            if mode == .withResponse { break }
         }
         // 头部索引前进后定期压缩, 防止数组前缀空洞增长
         if outboxHead > 64 && outboxHead * 2 > outboxChunks.count {
@@ -345,6 +364,7 @@ public final class BLEManager: NSObject, ObservableObject {
         outboxHead = 0
         outboxBytes = 0
         chipFullFlag = false
+        responseWriteInFlight = false
         chipFullWatchdog?.cancel()
         chipFullWatchdog = nil
     }
@@ -411,6 +431,10 @@ public final class BLEManager: NSObject, ObservableObject {
     public func applySerialParameters(_ params: SerialParameters,
                                       completion: @escaping (Bool, String) -> Void) {
         bleQueue.async {
+            guard self.activeProfileOnQueue?.supportsCH9140Configuration == true else {
+                DispatchQueue.main.async { completion(false, "当前 BLE UART 不支持 CH9140 串口参数配置") }
+                return
+            }
             guard let p = self.peripheral, let cc = self.configChar, self.isReadyOnQueue else {
                 DispatchQueue.main.async { completion(false, "配置通道不可用(未连接)") }
                 return
@@ -438,6 +462,10 @@ public final class BLEManager: NSObject, ObservableObject {
     public func applyModemLines(_ lines: ModemLines,
                                 completion: @escaping (Bool, String) -> Void) {
         bleQueue.async {
+            guard self.activeProfileOnQueue?.supportsCH9140Configuration == true else {
+                DispatchQueue.main.async { completion(false, "当前 BLE UART 不支持 CH9140 流控/MODEM 配置") }
+                return
+            }
             guard let p = self.peripheral, let cc = self.configChar, self.isReadyOnQueue else {
                 DispatchQueue.main.async { completion(false, "配置通道不可用(未连接)") }
                 return
@@ -572,7 +600,10 @@ extension BLEManager: CBCentralManagerDelegate {
         let advertised = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
         let isWCH = advertised.contains { $0.uuidString.uppercased() == CH9140UUID.service }
             || name.uppercased().hasPrefix("CH91")
-        guard self.scanShowAll || isWCH else { return }
+        let isBLEUART = advertised.contains {
+            $0.uuidString.uppercased() == BLETransportProfile.ffe1.serviceUUID
+        }
+        guard self.scanShowAll || isWCH || isBLEUART else { return }
         peripherals[p.identifier] = p
         discoveredAt[p.identifier] = Date()
         // 聚合并安排批量发布(同一设备一个窗口内的多个广播包只保留最新一条)
@@ -632,7 +663,8 @@ extension BLEManager: CBCentralManagerDelegate {
 
     public func centralManager(_ central: CBCentralManager, didConnect p: CBPeripheral) {
         // 迟到的连接成功回调(已被超时取消 / 已转连其他设备): 立即断开, 不进入发现流程
-        guard let pending = connectingPeripheral, p.isEqual(pending) else {
+        guard activePeripheralID == p.identifier,
+              let pending = connectingPeripheral, p.isEqual(pending) else {
             log("忽略过期连接的成功回调")
             central.cancelPeripheralConnection(p)
             return
@@ -643,17 +675,25 @@ extension BLEManager: CBCentralManagerDelegate {
         setState(.discovering)
         peripheral = p
         p.delegate = self
-        p.discoverServices([CBUUID(string: CH9140UUID.service)])
+        p.discoverServices([
+            CBUUID(string: BLETransportProfile.ch9140.serviceUUID),
+            CBUUID(string: BLETransportProfile.ffe1.serviceUUID)
+        ])
         DispatchQueue.main.async { self.connectedAt = Date() }
         startRSSIPolling()
     }
 
     public func centralManager(_ central: CBCentralManager,
                                didFailToConnect p: CBPeripheral, error: Error?) {
+        guard activePeripheralID == p.identifier else {
+            log("忽略过期连接的失败回调")
+            return
+        }
         disarmConnectTimeout()
         activePeripheralID = nil
         isReadyOnQueue = false
         updateMain { $0.connectedUUID = nil }
+        clearTransportSelection()
         log("连接失败: \(error?.localizedDescription ?? "未知错误")")
         stopRSSIPolling()
         setState(.failed(error?.localizedDescription ?? "连接失败"))
@@ -681,11 +721,31 @@ extension BLEManager: CBCentralManagerDelegate {
         isReadyOnQueue = false
         updateMain { $0.connectedUUID = nil }
         peripheral = nil
-        readChar = nil; writeChar = nil; configChar = nil
+        clearTransportSelection()
         clearOutbox()
         failPendingSerial(configFailReason)
         failPendingModem(configFailReason)
         stopRSSIPolling()
+    }
+
+    private func clearTransportSelection() {
+        readChar = nil
+        writeChar = nil
+        configChar = nil
+        activeProfileOnQueue = nil
+        dataWriteMode = nil
+        dataWriteLength = 0
+        responseWriteInFlight = false
+        notifiedCharacteristicUUIDs.removeAll()
+        updateMain {
+            $0.transportProfile = nil
+            $0.modemStatus = ModemStatus()
+            $0.chipBufferFull = false
+        }
+    }
+
+    private func isActivePeripheral(_ p: CBPeripheral) -> Bool {
+        activePeripheralID == p.identifier && peripheral?.isEqual(p) == true
     }
 }
 
@@ -693,50 +753,93 @@ extension BLEManager: CBCentralManagerDelegate {
 
 extension BLEManager: CBPeripheralDelegate {
 
+    private func failConnectionOnQueue(_ reason: String) {
+        guard let p = peripheral, isActivePeripheral(p) else { return }
+        log(reason)
+        central.cancelPeripheralConnection(p)
+        teardownConnectionOnQueue(configFailReason: reason)
+        setState(.failed(reason))
+    }
+
+    private func updateReadyStateIfPossible(_ p: CBPeripheral) {
+        guard isActivePeripheral(p), !isReadyOnQueue,
+              let profile = activeProfileOnQueue,
+              profile.isReady(readCharacteristicFound: readChar != nil,
+                              writeMode: dataWriteMode,
+                              configurationCharacteristicFound: configChar != nil,
+                              notifiedCharacteristicUUIDs: notifiedCharacteristicUUIDs),
+              let mode = dataWriteMode
+        else { return }
+        disarmConnectTimeout()
+        isReadyOnQueue = true
+        log("\(profile) 透传通道就绪 (写入 MTU \(dataWriteLength) 字节, \(mode))")
+        setState(.ready)
+    }
+
     public func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        guard error == nil, let services = p.services, !services.isEmpty else {
-            log("服务发现失败: \(error?.localizedDescription ?? "无服务")")
+        guard isActivePeripheral(p) else { return }
+        guard error == nil, let services = p.services else {
+            failConnectionOnQueue("服务发现失败: \(error?.localizedDescription ?? "无服务")")
             return
         }
-        for s in services { p.discoverCharacteristics(nil, for: s) }
+        guard let profile = BLETransportProfile.select(serviceUUIDs: services.map { $0.uuid.uuidString }) else {
+            failConnectionOnQueue("设备未提供 FFF0 或 FFE0 BLE 串口服务")
+            return
+        }
+        activeProfileOnQueue = profile
+        updateMain { $0.transportProfile = profile }
+        let service = services.first { $0.uuid.uuidString.uppercased() == profile.serviceUUID }!
+        log("发现 BLE 串口服务 \(profile.serviceUUID), 使用 \(profile)")
+        p.discoverCharacteristics(nil, for: service)
     }
 
     public func peripheral(_ p: CBPeripheral,
                            didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        guard isActivePeripheral(p), let profile = activeProfileOnQueue,
+              service.uuid.uuidString.uppercased() == profile.serviceUUID else { return }
         guard error == nil, let chars = service.characteristics else {
-            log("特征发现失败: \(error?.localizedDescription ?? "无特征")")
+            failConnectionOnQueue("特征发现失败: \(error?.localizedDescription ?? "无特征")")
             return
         }
         for c in chars {
-            switch c.uuid.uuidString.uppercased() {
-            case CH9140UUID.readCharacteristic:
+            let uuid = c.uuid.uuidString.uppercased()
+            if uuid == profile.readCharacteristicUUID {
+                guard BLETransportProfile.supportsNotifications(
+                    notify: c.properties.contains(.notify),
+                    indicate: c.properties.contains(.indicate)
+                ) else {
+                    failConnectionOnQueue("接收特征 \(uuid) 不支持 notify/indicate")
+                    return
+                }
                 readChar = c
                 p.setNotifyValue(true, for: c)
-            case CH9140UUID.writeCharacteristic:
+            }
+            if uuid == profile.writeCharacteristicUUID {
+                guard let mode = BLEWriteMode.select(
+                    writesWithoutResponse: c.properties.contains(.writeWithoutResponse),
+                    writesWithResponse: c.properties.contains(.write)
+                ) else {
+                    failConnectionOnQueue("发送特征 \(uuid) 不支持 write/write-without-response")
+                    return
+                }
                 writeChar = c
-            case CH9140UUID.configCharacteristic:
+                dataWriteMode = mode
+                dataWriteLength = p.maximumWriteValueLength(for: mode.coreBluetoothType)
+            }
+            if let configUUID = profile.configurationCharacteristicUUID, uuid == configUUID {
+                guard c.properties.contains(.write),
+                      BLETransportProfile.supportsNotifications(
+                        notify: c.properties.contains(.notify),
+                        indicate: c.properties.contains(.indicate)
+                      ) else {
+                    failConnectionOnQueue("CH9140 配置特征 \(uuid) 缺少 write 或 notify/indicate")
+                    return
+                }
                 configChar = c
                 p.setNotifyValue(true, for: c)
-            default: break
             }
         }
-        if readChar != nil, writeChar != nil, configChar != nil {
-            disarmConnectTimeout()
-            isReadyOnQueue = true
-            let mtu = max(20, p.maximumWriteValueLength(for: .withoutResponse))
-            log("透传通道就绪 (写入 MTU \(mtu) 字节)")
-            setState(.ready)
-        } else if service.uuid.uuidString.uppercased() == CH9140UUID.service {
-            // 特征不全: 明确指出缺了什么, 避免用户只看到误导性的"连接超时"
-            let missing = [
-                readChar == nil ? CH9140UUID.readCharacteristic : nil,
-                writeChar == nil ? CH9140UUID.writeCharacteristic : nil,
-                configChar == nil ? CH9140UUID.configCharacteristic : nil
-            ].compactMap { $0 }
-            if !missing.isEmpty {
-                log("透传服务缺少特征: \(missing.joined(separator: " / " )), 无法就绪(将按连接超时处理)")
-            }
-        }
+        updateReadyStateIfPossible(p)
     }
 
     public func peripheral(_ p: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
@@ -747,31 +850,53 @@ extension BLEManager: CBPeripheralDelegate {
 
     public func peripheral(_ p: CBPeripheral,
                            didUpdateNotificationStateFor c: CBCharacteristic, error: Error?) {
-        if let error { log("订阅 \(c.uuid.uuidString) 失败: \(error.localizedDescription)") }
+        guard isActivePeripheral(p),
+              let profile = activeProfileOnQueue else { return }
+        let uuid = c.uuid.uuidString.uppercased()
+        guard profile.notificationCharacteristicUUIDs.contains(uuid) else { return }
+        if let error {
+            failConnectionOnQueue("订阅 \(uuid) 失败: \(error.localizedDescription)")
+            return
+        }
+        guard c.isNotifying else {
+            failConnectionOnQueue("订阅 \(uuid) 后通知未启用")
+            return
+        }
+        notifiedCharacteristicUUIDs.insert(uuid)
+        updateReadyStateIfPossible(p)
     }
 
     public func peripheralIsReady(toSendWriteWithoutResponse p: CBPeripheral) {
-        pumpOutbox()
+        if isActivePeripheral(p) { pumpOutbox() }
     }
 
     public func peripheral(_ p: CBPeripheral,
                            didWriteValueFor c: CBCharacteristic, error: Error?) {
         if let error { log("写入 \(c.uuid.uuidString) 出错: \(error.localizedDescription)") }
+        guard isActivePeripheral(p),
+              c === writeChar, dataWriteMode == .withResponse else { return }
+        responseWriteInFlight = false
+        if error != nil {
+            clearOutbox()
+            return
+        }
+        pumpOutbox()
     }
 
     public func peripheral(_ p: CBPeripheral,
                            didUpdateValueFor c: CBCharacteristic, error: Error?) {
         // 只处理当前设备的数据(防御多连接并存期间的串流)
-        guard let current = peripheral, p.isEqual(current) else { return }
+        guard isActivePeripheral(p) else { return }
         guard error == nil, let value = c.value, !value.isEmpty else {
             if let error { log("读取出错: \(error.localizedDescription)") }
             return
         }
-        switch c.uuid.uuidString.uppercased() {
-        case CH9140UUID.readCharacteristic:
+        guard let profile = activeProfileOnQueue else { return }
+        switch profile.inboundChannel(for: c.uuid.uuidString) {
+        case .data:
             DispatchQueue.main.async { self.onReceive?(value) }
 
-        case CH9140UUID.configCharacteristic:
+        case .configuration:
             // 帧拆分解码: 容忍固件粘连多帧或夹带噪声, 可解析的帧不陪葬
             let (packets, residue) = CH9140Protocol.decodeFrames(value)
             if !residue.isEmpty {
@@ -779,7 +904,7 @@ extension BLEManager: CBPeripheralDelegate {
             }
             for packet in packets { handleConfigPacket(packet) }
 
-        default: break
+        case nil: break
         }
     }
 
@@ -815,6 +940,15 @@ extension BLEManager: CBPeripheralDelegate {
             } else {
                 pumpOutbox()            // 缓冲区已空, 继续发送
             }
+        }
+    }
+}
+
+private extension BLEWriteMode {
+    var coreBluetoothType: CBCharacteristicWriteType {
+        switch self {
+        case .withoutResponse: .withoutResponse
+        case .withResponse: .withResponse
         }
     }
 }

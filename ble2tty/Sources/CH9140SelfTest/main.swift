@@ -77,6 +77,78 @@ check(CH9140Protocol.decode(Data([0x86, 0x00, 0x09, 0x00, 0x00, 0xC2, 0x01, 0x00
 check(CH9140Protocol.decode(Data([0x99, 0x00, 0x03, 0x00, 0x01, 0x00, 0x01])) == nil,
       "未知指令拒绝解析")
 
+print("== BLE 串口 profile 与写策略 ==")
+check(BLETransportProfile.select(serviceUUIDs: ["FFF0"]) == .ch9140,
+      "FFF0 服务选择 CH9140 profile")
+check(BLETransportProfile.select(serviceUUIDs: ["FFE0"]) == .ffe1,
+      "FFE0 服务选择 FFE1 profile")
+check(BLETransportProfile.select(serviceUUIDs: ["FFE0", "FFF0"]) == .ch9140,
+      "同时发现两类服务时优先 CH9140")
+check(BLETransportProfile.select(serviceUUIDs: ["180F"]) == nil,
+      "未知服务不选择 BLE UART profile")
+if let profile = BLETransportProfile.select(serviceUUIDs: ["FFE0"]) {
+    let chipStatusFrame = Data([0x88, 0x00, 0x03, 0x00, 0x01, 0x00, 0x01])
+    check(profile.readCharacteristicUUID == "FFE1"
+          && profile.writeCharacteristicUUID == "FFE1"
+          && profile.notificationCharacteristicUUIDs == ["FFE1"],
+          "FFE1 同一特征承担接收通知与发送")
+    check(profile.inboundChannel(for: "FFE1") == .data
+          && CH9140Protocol.decode(chipStatusFrame) != nil,
+          "FFE1 特征上的 0x88 样例被分类为数据通道")
+    check(profile.inboundChannel(for: "FFF3") == nil
+          && profile.configurationCharacteristicUUID == nil
+          && !profile.supportsCH9140Configuration,
+          "FFE1 profile 不含 CH9140 配置/状态通道")
+    check(!BLETransportProfile.supportsNotifications(notify: false, indicate: false)
+          && BLETransportProfile.supportsNotifications(notify: false, indicate: true),
+          "接收特征必须支持 notify 或 indicate")
+    check(!profile.isReady(readCharacteristicFound: true,
+                           writeMode: .withoutResponse,
+                           configurationCharacteristicFound: false,
+                           notifiedCharacteristicUUIDs: []),
+          "FFE1 未收到通知启用回调时保持未就绪")
+    check(profile.isReady(readCharacteristicFound: true,
+                          writeMode: .withoutResponse,
+                          configurationCharacteristicFound: false,
+                          notifiedCharacteristicUUIDs: ["FFE1"]),
+          "FFE1 同一特征具备读写与通知后就绪")
+    check(!profile.isReady(readCharacteristicFound: false,
+                           writeMode: .withoutResponse,
+                           configurationCharacteristicFound: false,
+                           notifiedCharacteristicUUIDs: ["FFE1"]),
+          "FFE1 缺少接收特征时保持未就绪")
+    check(!profile.isReady(readCharacteristicFound: true,
+                           writeMode: nil,
+                           configurationCharacteristicFound: false,
+                           notifiedCharacteristicUUIDs: ["FFE1"]),
+          "FFE1 缺少写属性时保持未就绪")
+}
+check(BLEWriteMode.select(writesWithoutResponse: true, writesWithResponse: false) == .withoutResponse,
+      "writeWithoutResponse 属性选择无响应写")
+check(BLEWriteMode.select(writesWithoutResponse: false, writesWithResponse: true) == .withResponse,
+      "write 属性选择有响应写")
+check(BLEWriteMode.select(writesWithoutResponse: true, writesWithResponse: true) == .withoutResponse,
+      "两种写属性都有时优先无响应写")
+check(BLEWriteMode.select(writesWithoutResponse: false, writesWithResponse: false) == nil,
+      "无写属性的特征不能建立发送通路")
+if let profile = BLETransportProfile.select(serviceUUIDs: ["FFF0"]) {
+    check(!profile.isReady(readCharacteristicFound: true,
+                           writeMode: .withoutResponse,
+                           configurationCharacteristicFound: false,
+                           notifiedCharacteristicUUIDs: ["FFF1", "FFF3"]),
+          "CH9140 缺少 FFF3 配置特征时保持未就绪")
+    check(!profile.isReady(readCharacteristicFound: true,
+                           writeMode: .withoutResponse,
+                           configurationCharacteristicFound: true,
+                           notifiedCharacteristicUUIDs: ["FFF1"]),
+          "CH9140 未启用 FFF3 通知时保持未就绪")
+    check(profile.isReady(readCharacteristicFound: true,
+                          writeMode: .withoutResponse,
+                          configurationCharacteristicFound: true,
+                          notifiedCharacteristicUUIDs: ["FFF1", "FFF3"]),
+          "CH9140 数据和配置通知启用后就绪")
+}
+
 print("== HexUtil ==")
 check(HexUtil.hexString(Data([0x0D, 0x0A])) == "0D 0A", "hexString")
 check(HexUtil.data(fromHexString: "0D 0A") == Data([0x0D, 0x0A]), "data fromHex '0D 0A'")
